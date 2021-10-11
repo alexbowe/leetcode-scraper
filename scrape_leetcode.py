@@ -2,10 +2,12 @@ import json
 import re
 import requests
 import bs4
-import sqlite3
 import logging
 import diskcache
 import jsonpickle
+import pickle
+import os
+import time
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -16,9 +18,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 LOGGER = logging.getLogger("LeetCode")
 CACHE_FILE = ".cache"
+COOKIE_PATH = "cookies.pkl"
 PROBLEM_LIST_URL = "https://leetcode.com/api/problems/algorithms/"
 PROBLEM_URL_TEMPLATE = "https://leetcode.com/problems/{slug}/"
-
+LOGIN_URL = "https://leetcode.com/accounts/login"
 
 # TODO: See how it works with a locked question
 # TODO: Build graph (play with edge definitions, related is bi-directional, but make it directional by ranking in terms of difficulty - level and success rate)
@@ -69,37 +72,62 @@ def parse_problem(data, soup):
     related = [get_slug(x) for x in related_html]
     tags = [get_tag(x) for x in tags_html]
     companies = [get_company(x) for x in companies_html]
-    if companies:
-        print("FOUND!")
-        exit()
     return Problem(data, tags=tags, related=related, companies=companies)
 
 
 def make_problem(driver, data, parser=parse_problem):
     slug = data["stat"]["question__title_slug"]
     driver.get(PROBLEM_URL_TEMPLATE.format(slug=slug))
-    WebDriverWait(driver, 100).until(
+    WebDriverWait(driver, 20).until(
         EC.invisibility_of_element_located((By.ID, "initial-loading"))
     )
+    time.sleep(2)
     # Get current tab page source
     html = driver.page_source
     soup = bs4.BeautifulSoup(html, "html.parser")
     return parse_problem(data, soup)
 
 
-def init_chrome_driver():
+def init_chrome_driver(cookies=[]):
     options = Options()
-    chrome_options = webdriver.ChromeOptions()
     options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=options, executable_path=ChromeDriverManager().install())
+
+    driver = webdriver.Chrome(options=options, executable_path=ChromeDriverManager().install())
+    if cookies:
+        driver.get(LOGIN_URL)
+        for cookie in cookies:
+            driver.add_cookie(cookie)
+    return driver
+
+
+def login():
+    browser_cookies = {}
+
+    # TODO: Move cookie handling outside of this
+    if os.path.isfile(COOKIE_PATH):
+        with open(COOKIE_PATH, 'rb') as f:
+            return pickle.load(f)
+    else:
+        LOGGER.info("Starting Chrome - please log in")
+        driver = webdriver.Chrome(executable_path=ChromeDriverManager().install())
+        driver.get(LOGIN_URL)
+
+        WebDriverWait(driver, 5 * 60).until(
+            lambda driver: driver.current_url.find("login") < 0
+        )
+
+    browser_cookies = driver.get_cookies()
+    with open(COOKIE_PATH, 'wb') as f:
+        pickle.dump(browser_cookies, f)
+    LOGGER.info("Login successful")
+    
+    return browser_cookies
 
 
 class LeetCode:
     def __init__(self, driver=None, cache=None):
         self._cache = cache or diskcache.Cache(CACHE_FILE)
-        self._driver = driver or init_chrome_driver()
+        self._driver = driver or init_chrome_driver(cookies=login())
 
     def _problem_dict(self):
         payload = json.loads(requests.get(PROBLEM_LIST_URL).content)
@@ -112,9 +140,9 @@ class LeetCode:
         problems = self._problem_dict()
         return sorted(problems.keys())
 
-    def get_problem(self, title):
-        cached = title in self._cache
-        source = "cache" if cached  else "web"
+    def get_problem(self, title, skip_cache=False):
+        cached = not skip_cache and title in self._cache
+        source = "cache" if cached else "web"
         LOGGER.info(f"Accessing {title} from {source}")
         if cached:
             return self._cache[title]
